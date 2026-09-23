@@ -379,6 +379,31 @@ def generate_standard_speech(model, sample_path, text, language, out_path, statu
     return out_path
 
 
+def prepare_sample(sample_path, status_callback=None):
+    """Convert the voice sample (mp3, m4a, flac, wav...) into a clean mono
+    WAV using the bundled ffmpeg. The audio libraries used by the TTS engine
+    often can't open MP3/M4A files directly, which causes errors like
+    "Error opening '...mp3': File does not exist or is not a regular file".
+    If conversion fails for any reason, the original path is used as-is."""
+    import subprocess
+    try:
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        out_path = os.path.join(tempfile.gettempdir(), "voice_clone_sample.wav")
+        if status_callback:
+            status_callback("Preparing voice sample...")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            [ffmpeg_exe, "-y", "-i", sample_path, "-vn", "-ac", "1", "-ar", "22050", out_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
+        )
+        if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+            return out_path
+    except Exception:
+        pass
+    return sample_path
+
+
 def ensure_ffmpeg_ready():
     """Point pydub at the bundled ffmpeg binary from imageio-ffmpeg, so the
     user never has to separately install ffmpeg to get MP3 output."""
@@ -744,6 +769,7 @@ class VoiceCloneApp:
     def _generate_worker(self, sample, script):
         try:
             lang = self.language_var.get()
+            sample = prepare_sample(sample, status_callback=self._set_status_threadsafe)
 
             if self.auto_translate_var.get():
                 script = translate_script(script, lang, status_callback=self._set_status_threadsafe)
