@@ -99,6 +99,14 @@ _urdu_model = None
 _urdu_lock = threading.Lock()
 _ffmpeg_ready = False
 
+# DirectML (AMD/Intel GPU) is experimental and is the usual cause of
+# "Cannot set version_counter for inference tensor", because the TTS
+# library runs its models under torch.inference_mode() and DirectML can't
+# handle those tensors. So it is OFF by default. To try it anyway, set the
+# environment variable VCR_USE_DIRECTML=1. If that error is ever hit at
+# runtime, the app flips this flag and retries on CPU automatically.
+_force_cpu = os.environ.get("VCR_USE_DIRECTML", "0") != "1"
+
 
 def get_tts_model(status_callback=None, fast_mode=False):
     """Load (and cache) the voice-cloning model. Downloads it on first use.
@@ -155,6 +163,8 @@ def _pick_best_device(status_callback=None):
     # experimental and doesn't support every operation, so we sanity-check
     # it with a tiny test op before trusting it.
     try:
+        if _force_cpu:
+            raise RuntimeError("DirectML disabled - using CPU")
         import torch_directml
         if torch_directml.is_available():
             dml_device = torch_directml.device()
@@ -299,7 +309,7 @@ def generate_urdu_speech(sample_path, text, out_path, status_callback=None):
     for i, chunk in enumerate(chunks):
         if status_callback:
             status_callback(f"Generating Urdu audio... part {i + 1} of {len(chunks)}")
-        with torch.inference_mode():
+        with torch.no_grad():
             result = model.inference(
                 text=chunk,
                 language="ur",
@@ -330,7 +340,7 @@ def generate_standard_speech(model, sample_path, text, language, out_path, statu
 
     chunks = _chunk_text(text, max_chars=400)
     if len(chunks) == 1:
-        with torch.inference_mode():
+        with torch.no_grad():
             model.tts_to_file(
                 text=chunks[0],
                 speaker_wav=sample_path,
@@ -349,7 +359,7 @@ def generate_standard_speech(model, sample_path, text, language, out_path, statu
             if status_callback:
                 status_callback(f"Generating audio... part {i + 1} of {len(chunks)}")
             part_path = os.path.join(tmp_dir, f"part_{i}.wav")
-            with torch.inference_mode():
+            with torch.no_grad():
                 model.tts_to_file(
                     text=chunk,
                     speaker_wav=sample_path,
@@ -757,6 +767,20 @@ class VoiceCloneApp:
         except Exception as e:
             import traceback
             traceback.print_exc()
+            msg = str(e)
+            global _force_cpu, _tts_model, _fast_tts_model, _urdu_model
+            if ("version_counter" in msg or "inference tensor" in msg) and not getattr(self, "_retried_cpu", False):
+                # GPU (DirectML) path can't handle the model's inference
+                # tensors. Drop the cached models, switch to CPU, retry once.
+                self._retried_cpu = True
+                _force_cpu = True
+                _tts_model = _fast_tts_model = _urdu_model = None
+                self._set_status_threadsafe("GPU path failed - retrying on CPU...")
+                try:
+                    self._generate_worker(sample, script)
+                finally:
+                    self._retried_cpu = False
+                return
             self._set_status_threadsafe(f"Error: {e}")
             self.root.after(0, self._on_generate_done, False)
 
